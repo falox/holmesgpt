@@ -48,7 +48,10 @@ from ag_ui.core import (
     ToolCallStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
+    ToolCallResultEvent,
     RunErrorEvent,
+    StepStartedEvent,
+    StepFinishedEvent,
 )
 from ag_ui.encoder import EventEncoder
 
@@ -122,9 +125,17 @@ def agui_chat(input_data: RunAgentInput, request: Request):
 
     # Hijack the existing HolmesGPT cat stream output and format as AG-UI events.
 
+    def _log_and_encode(event):
+        """Log outgoing AG-UI event and encode it."""
+        event_type = event.type if hasattr(event, "type") else "unknown"
+        event_data = event.model_dump(exclude={"type"}) if hasattr(event, "model_dump") else str(event)
+        event_data_str = str(event_data)[:150]
+        logging.info(f"🟡 [AGUI_EVENT] type={event_type} | {event_data_str}")
+        return encoder.encode(event)
+
     async def event_generator(message_history):
         try:
-            yield encoder.encode(
+            yield _log_and_encode(
                 RunStartedEvent(
                     type=EventType.RUN_STARTED,
                     thread_id=input_data.thread_id,
@@ -146,6 +157,10 @@ def agui_chat(input_data: RunAgentInput, request: Request):
                 else:
                     event_type = "unknown"
                     logging.debug(f"Streaming chunk: {chunk}")
+                # Debug: Log all stream events for analysis
+                chunk_data = chunk.data if hasattr(chunk, "data") else {}
+                chunk_data_str = str(chunk_data)[:200]
+                logging.info(f"🔴 [STREAM_EVENT] type={event_type} data={chunk_data_str}")
                 if hasattr(chunk, "data"):
                     tool_name = chunk.data.get(
                         "tool_name", chunk.data.get("name", "Tool")
@@ -158,12 +173,11 @@ def agui_chat(input_data: RunAgentInput, request: Request):
                         async for event in _stream_agui_text_message_event(
                             message=str(chunk.data.get("content", ""))
                         ):
-                            yield encoder.encode(event)
+                            yield _log_and_encode(event)
                     elif event_type == StreamEvents.START_TOOL:
-                        async for event in _stream_agui_text_message_event(
-                            message=f"🔧 Using Agent tool: `{tool_name}`..."
-                        ):
-                            yield encoder.encode(event)
+                        # Tool started - we'll emit events on TOOL_RESULT
+                        # when we have both input args and output data
+                        pass
                     elif event_type == StreamEvents.TOOL_RESULT:
                         logging.debug(
                             f"🔧 TOOL_RESULT received - tool_name: {tool_name}"
@@ -184,7 +198,7 @@ def agui_chat(input_data: RunAgentInput, request: Request):
                                 tool_call_name="graph_timeseries_data",
                                 tool_call_args=ts_data,
                             ):
-                                yield encoder.encode(tool_event)
+                                yield _log_and_encode(tool_event)
                         if _should_execute_suggested_query(
                             backend_tool_name=tool_name, frontend_tools=input_data.tools
                         ):
@@ -206,20 +220,78 @@ def agui_chat(input_data: RunAgentInput, request: Request):
                                 tool_call_name=front_end_query_tool,
                                 tool_call_args={"query": _parse_query(chunk.data)},
                             ):
-                                yield encoder.encode(tool_event)
+                                yield _log_and_encode(tool_event)
                         if not front_end_tool_invoked:
-                            # TODO [FUTURE]: Render "TodoWrite" tool_name results prettier. Use code block for now.
-                            #                 Ideally using TOOL_STEP events.
-                            if tool_name == "TodoWrite":
-                                tool_message = _format_todo_write(data=chunk.data)
-                            else:
-                                tool_message = f"🔧 {tool_name} result:\n{chunk.data.get('result', {}).get('data', '')[0:200]}..."
+                            # Get result data - contains both params (input) and data (output)
+                            result_data = chunk.data.get("result", {})
 
-                            async for event in _stream_agui_text_message_event(
-                                message=tool_message
-                            ):
-                                yield encoder.encode(event)
-            yield encoder.encode(
+                            if tool_name == "TodoWrite":
+                                # Emit STEP events for each todo item
+                                tool_args = result_data.get("params", {})
+                                todos = tool_args.get("todos", [])
+                                for todo in todos:
+                                    status = todo.get("status", "pending")
+                                    content = todo.get("content", "")
+                                    # Emit STEP_STARTED for all items
+                                    yield _log_and_encode(
+                                        StepStartedEvent(
+                                            type=EventType.STEP_STARTED,
+                                            stepName=content,
+                                        )
+                                    )
+                                    # Emit STEP_FINISHED only for completed items
+                                    if status == "completed":
+                                        yield _log_and_encode(
+                                            StepFinishedEvent(
+                                                type=EventType.STEP_FINISHED,
+                                                stepName=content,
+                                            )
+                                        )
+                            else:
+                                # Emit backend tool call events (START, ARGS, END, RESULT)
+                                tool_call_id = chunk.data.get(
+                                    "tool_call_id", chunk.data.get("id", str(uuid.uuid4()))
+                                )
+                                # Get input args from result.params
+                                tool_args = result_data.get("params", {})
+                                result_content = result_data.get("data", "")
+                                if isinstance(result_content, dict):
+                                    result_content = json.dumps(result_content)
+
+                                # Emit TOOL_CALL_START
+                                yield _log_and_encode(
+                                    ToolCallStartEvent(
+                                        type=EventType.TOOL_CALL_START,
+                                        tool_call_id=tool_call_id,
+                                        tool_call_name=tool_name,
+                                    )
+                                )
+                                # Emit TOOL_CALL_ARGS with input arguments
+                                yield _log_and_encode(
+                                    ToolCallArgsEvent(
+                                        type=EventType.TOOL_CALL_ARGS,
+                                        tool_call_id=tool_call_id,
+                                        delta=json.dumps(tool_args) if tool_args else "{}",
+                                    )
+                                )
+                                # Emit TOOL_CALL_END
+                                yield _log_and_encode(
+                                    ToolCallEndEvent(
+                                        type=EventType.TOOL_CALL_END,
+                                        tool_call_id=tool_call_id,
+                                    )
+                                )
+                                # Emit TOOL_CALL_RESULT with output
+                                yield _log_and_encode(
+                                    ToolCallResultEvent(
+                                        type=EventType.TOOL_CALL_RESULT,
+                                        tool_call_id=tool_call_id,
+                                        message_id=str(uuid.uuid4()),
+                                        content=str(result_content),
+                                        role="tool",
+                                    )
+                                )
+            yield _log_and_encode(
                 RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
                     thread_id=input_data.thread_id,
@@ -228,7 +300,7 @@ def agui_chat(input_data: RunAgentInput, request: Request):
             )
         except Exception as e:
             logging.error(f"Error in /api/agui/chat: {e}", exc_info=True)
-            yield encoder.encode(
+            yield _log_and_encode(
                 RunErrorEvent(
                     type=EventType.RUN_ERROR,
                     message=f"Agent encountered an error: {str(e)}",
