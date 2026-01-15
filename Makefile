@@ -21,3 +21,9 @@ docs-build:
 
 docs-strict:
 	poetry run mkdocs serve --dev-addr=127.0.0.1:7000 --strict
+
+ag-ui:
+	poetry run python experimental/ag-ui/server-agui.py
+
+a2a:
+	poetry run python -m experimental.a2a
