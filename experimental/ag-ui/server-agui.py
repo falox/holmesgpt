@@ -15,6 +15,8 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
+
 import uvicorn
 import colorlog
 
@@ -28,7 +30,7 @@ from holmes.common.env_vars import (
     HOLMES_HOST,
     HOLMES_PORT,
 )
-from holmes.config import Config
+from holmes.config import Config, DEFAULT_CONFIG_LOCATION
 from holmes.core.conversations import (
     build_chat_messages,
 )
@@ -75,7 +77,12 @@ def init_logging():
 
 
 init_logging()
-config = Config.load_from_env()
+
+# Default to gpt-4.1 if MODEL not set
+if not os.environ.get("MODEL"):
+    os.environ["MODEL"] = "gpt-4.1"
+
+config = Config.load_from_file(Path(DEFAULT_CONFIG_LOCATION))
 dal = config.dal
 
 app = FastAPI()

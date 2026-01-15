@@ -16,6 +16,7 @@ if add_custom_certificate(ADDITIONAL_CERTIFICATE):
 
 import argparse
 import logging
+from pathlib import Path
 
 import colorlog
 import uvicorn
@@ -24,7 +25,7 @@ from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 
-from holmes.config import Config
+from holmes.config import Config, DEFAULT_CONFIG_LOCATION
 from experimental.a2a.agent_card import HOLMES_AGENT_CARD
 from experimental.a2a.server_a2a import HolmesAgentExecutor
 
@@ -87,7 +88,7 @@ def main():
         os.environ["MODEL"] = "gpt-4.1"
 
     logging.info("Loading HolmesGPT configuration...")
-    config = Config.load_from_env()
+    config = Config.load_from_file(Path(DEFAULT_CONFIG_LOCATION))
 
     logging.info(f"Creating A2A server on {args.host}:{args.port}...")
     server = create_a2a_server(config)
