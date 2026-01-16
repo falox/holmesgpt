@@ -13,6 +13,7 @@ if add_custom_certificate(ADDITIONAL_CERTIFICATE):
 # Safe to import networked libs below
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -54,8 +55,97 @@ from ag_ui.core import (
     RunErrorEvent,
     StepStartedEvent,
     StepFinishedEvent,
+    CustomEvent,
 )
 from ag_ui.encoder import EventEncoder
+
+
+class StepTracker:
+    """Tracks step states within a single run to emit proper AG-UI step events.
+
+    - STEP_STARTED: Emitted only once, the first time a step is seen
+    - CustomEvent (step_update): Emitted for in_progress status updates
+    - STEP_FINISHED or CustomEvent (failed): Emitted for final status (completed/failed)
+    """
+
+    def __init__(self):
+        # Maps step content -> current status
+        self._steps: dict[str, str] = {}
+
+    def process_todos(self, todos: list[dict]):
+        """Process a list of todos and yield appropriate AG-UI events.
+
+        Args:
+            todos: List of todo items with 'content', 'status', and optionally 'activeForm'
+
+        Yields:
+            AG-UI events (StepStartedEvent, StepFinishedEvent, CustomEvent)
+        """
+        for todo in todos:
+            content = todo.get("content", "")
+            status = todo.get("status", "pending")
+            active_form = todo.get("activeForm", "")
+
+            if not content:
+                continue
+
+            previous_status = self._steps.get(content)
+
+            # First time seeing this step -> emit STEP_STARTED
+            if previous_status is None:
+                self._steps[content] = status
+                yield StepStartedEvent(
+                    type=EventType.STEP_STARTED,
+                    stepName=content,
+                )
+
+                # If it's already completed on first sight, also emit STEP_FINISHED
+                if status == "completed":
+                    yield StepFinishedEvent(
+                        type=EventType.STEP_FINISHED,
+                        stepName=content,
+                    )
+                # If it's already failed on first sight, emit custom failed event
+                elif status == "failed":
+                    yield CustomEvent(
+                        name="step_update",
+                        value={
+                            "stepName": content,
+                            "status": "failed",
+                            "activeForm": active_form,
+                        },
+                    )
+                # If in_progress, emit custom in_progress event
+                elif status == "in_progress":
+                    yield CustomEvent(
+                        name="step_update",
+                        value={
+                            "stepName": content,
+                            "status": "in_progress",
+                            "activeForm": active_form,
+                        },
+                    )
+
+            # Status changed from previous
+            elif previous_status != status:
+                self._steps[content] = status
+
+                # Transition to completed -> emit STEP_FINISHED
+                if status == "completed":
+                    yield StepFinishedEvent(
+                        type=EventType.STEP_FINISHED,
+                        stepName=content,
+                    )
+                # Transition to in_progress or failed -> emit custom event
+                elif status in ("in_progress", "failed"):
+                    yield CustomEvent(
+                        name="step_update",
+                        value={
+                            "stepName": content,
+                            "status": status,
+                            "activeForm": active_form,
+                        },
+                    )
 
 
 def init_logging():
@@ -102,6 +192,232 @@ def agui_chat_health(request: Request):
     return JSONResponse(content="ok")
 
 
+def _handle_investigate_request(
+    input_data: RunAgentInput, chat_request: ChatRequest, encoder: EventEncoder
+):
+    """Handle investigate requests by fetching alerts from AlertManager and investigating them."""
+    # Check if AlertManager is configured
+    if not config.alertmanager_url:
+        # Return error response
+        async def error_generator():
+            yield encoder.encode(
+                RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+            async for event in _stream_agui_text_message_event(
+                message="AlertManager URL is not configured. Please set `alertmanager_url` in your Holmes config file (~/.holmes/config.yaml)."
+            ):
+                yield encoder.encode(event)
+            yield encoder.encode(
+                RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+
+        return StreamingResponse(error_generator(), media_type=encoder.get_content_type())
+
+    # Parse the filter from the message (text after "investigate")
+    alert_filter = _parse_investigate_message(chat_request.ask)
+    alertname_pattern = re.compile(alert_filter) if alert_filter else None
+
+    # Create AlertManager source and fetch issues
+    try:
+        source = config.create_alertmanager_source()
+        issues = source.fetch_issues()
+    except Exception as e:
+        logging.error(f"Failed to fetch issues from AlertManager: {e}", exc_info=True)
+        error_message = str(e)
+
+        async def error_generator():
+            yield encoder.encode(
+                RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+            async for event in _stream_agui_text_message_event(
+                message=f"Failed to fetch alerts from AlertManager: {error_message}"
+            ):
+                yield encoder.encode(event)
+            yield encoder.encode(
+                RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+
+        return StreamingResponse(error_generator(), media_type=encoder.get_content_type())
+
+    # Filter issues if a pattern was provided
+    if alertname_pattern:
+        issues = [issue for issue in issues if alertname_pattern.search(issue.name) or alertname_pattern.search(issue.id)]
+
+    if not issues:
+        async def no_alerts_generator():
+            yield encoder.encode(
+                RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+            message = "No firing alerts found in AlertManager"
+            if alert_filter:
+                message += f" matching filter '{alert_filter}'"
+            message += "."
+            async for event in _stream_agui_text_message_event(message=message):
+                yield encoder.encode(event)
+            yield encoder.encode(
+                RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+
+        return StreamingResponse(no_alerts_generator(), media_type=encoder.get_content_type())
+
+    # Limit to first issue for now (can be extended to handle multiple)
+    issue = issues[0]
+    logging.info(f"Investigating alert: {issue.name} (1 of {len(issues)} alerts)")
+
+    # Create the issue investigator
+    ai = config.create_issue_investigator(dal=dal, model=chat_request.model)
+
+    def _log_and_encode(event):
+        """Log outgoing AG-UI event and encode it."""
+        event_type = event.type if hasattr(event, "type") else "unknown"
+        event_data = (
+            event.model_dump(exclude={"type"}) if hasattr(event, "model_dump") else str(event)
+        )
+        event_data_str = str(event_data)[:150]
+        logging.info(f"🟡 [AGUI_EVENT] type={event_type} | {event_data_str}")
+        return encoder.encode(event)
+
+    async def event_generator():
+        step_tracker = StepTracker()
+
+        try:
+            yield _log_and_encode(
+                RunStartedEvent(
+                    type=EventType.RUN_STARTED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+
+            # Send initial message about what we're investigating
+            intro_message = f"Investigating alert: **{issue.name}**"
+            if len(issues) > 1:
+                intro_message += f" (1 of {len(issues)} matching alerts)"
+            intro_message += f"\n\n{issue.presentation_key_metadata or ''}\n\n---\n\n"
+            async for event in _stream_agui_text_message_event(message=intro_message):
+                yield _log_and_encode(event)
+
+            # Use investigate_stream to stream the investigation
+            hgpt_investigate_stream = ai.investigate_stream(
+                issue=issue,
+                prompt="builtin://generic_investigation.jinja2",
+            )
+            for chunk in hgpt_investigate_stream:
+                if hasattr(chunk, "event"):
+                    event_type = (
+                        chunk.event.value
+                        if hasattr(chunk.event, "value")
+                        else str(chunk.event)
+                    )
+                    logging.debug(f"Streaming chunk: {event_type}")
+                else:
+                    event_type = "unknown"
+                    logging.debug(f"Streaming chunk: {chunk}")
+                chunk_data = chunk.data if hasattr(chunk, "data") else {}
+                chunk_data_str = str(chunk_data)[:200]
+                logging.info(f"🔴 [STREAM_EVENT] type={event_type} data={chunk_data_str}")
+                if hasattr(chunk, "data"):
+                    tool_name = chunk.data.get("tool_name", chunk.data.get("name", "Tool"))
+                    if event_type in (
+                        StreamEvents.AI_MESSAGE,
+                        StreamEvents.ANSWER_END,
+                        "unknown",
+                    ):
+                        async for event in _stream_agui_text_message_event(
+                            message=str(chunk.data.get("content", ""))
+                        ):
+                            yield _log_and_encode(event)
+                    elif event_type == StreamEvents.TOOL_RESULT:
+                        # Get result data - contains both params (input) and data (output)
+                        result_data = chunk.data.get("result", {})
+
+                        if tool_name == "TodoWrite":
+                            tool_args = result_data.get("params", {})
+                            todos = tool_args.get("todos", [])
+                            for step_event in step_tracker.process_todos(todos):
+                                yield _log_and_encode(step_event)
+                        else:
+                            # Emit backend tool call events for investigate
+                            tool_call_id = chunk.data.get(
+                                "tool_call_id", chunk.data.get("id", str(uuid.uuid4()))
+                            )
+                            tool_args = result_data.get("params", {})
+                            result_content = result_data.get("data", "")
+                            if isinstance(result_content, dict):
+                                result_content = json.dumps(result_content)
+
+                            yield _log_and_encode(
+                                ToolCallStartEvent(
+                                    type=EventType.TOOL_CALL_START,
+                                    tool_call_id=tool_call_id,
+                                    tool_call_name=tool_name,
+                                )
+                            )
+                            yield _log_and_encode(
+                                ToolCallArgsEvent(
+                                    type=EventType.TOOL_CALL_ARGS,
+                                    tool_call_id=tool_call_id,
+                                    delta=json.dumps(tool_args) if tool_args else "{}",
+                                )
+                            )
+                            yield _log_and_encode(
+                                ToolCallEndEvent(
+                                    type=EventType.TOOL_CALL_END,
+                                    tool_call_id=tool_call_id,
+                                )
+                            )
+                            yield _log_and_encode(
+                                ToolCallResultEvent(
+                                    type=EventType.TOOL_CALL_RESULT,
+                                    tool_call_id=tool_call_id,
+                                    message_id=str(uuid.uuid4()),
+                                    content=str(result_content),
+                                    role="tool",
+                                )
+                            )
+            yield _log_and_encode(
+                RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+        except Exception as e:
+            logging.error(f"Error in investigate request: {e}", exc_info=True)
+            yield _log_and_encode(
+                RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message=f"Investigation encountered an error: {str(e)}",
+                )
+            )
+
+    return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
+
+
 @app.post("/api/agui/chat")
 def agui_chat(input_data: RunAgentInput, request: Request):
     accept_header = request.headers.get("accept", "")
@@ -118,6 +434,11 @@ def agui_chat(input_data: RunAgentInput, request: Request):
         return PlainTextResponse(
             "Bad request. Chat message cannot be empty", status_code=400
         )
+
+    # Check if this is an investigate request
+    if _is_investigate_request(chat_request.ask):
+        logging.info(f"Detected investigate request: {chat_request.ask[:100]}...")
+        return _handle_investigate_request(input_data, chat_request, encoder)
 
     ai = config.create_agui_toolcalling_llm(dal=dal, model=chat_request.model)
     global_instructions = dal.get_global_instructions_for_account()
@@ -141,6 +462,8 @@ def agui_chat(input_data: RunAgentInput, request: Request):
         return encoder.encode(event)
 
     async def event_generator(message_history):
+        step_tracker = StepTracker()
+
         try:
             yield _log_and_encode(
                 RunStartedEvent(
@@ -233,27 +556,10 @@ def agui_chat(input_data: RunAgentInput, request: Request):
                             result_data = chunk.data.get("result", {})
 
                             if tool_name == "TodoWrite":
-                                # Emit STEP events for each todo item
                                 tool_args = result_data.get("params", {})
                                 todos = tool_args.get("todos", [])
-                                for todo in todos:
-                                    status = todo.get("status", "pending")
-                                    content = todo.get("content", "")
-                                    # Emit STEP_STARTED for all items
-                                    yield _log_and_encode(
-                                        StepStartedEvent(
-                                            type=EventType.STEP_STARTED,
-                                            stepName=content,
-                                        )
-                                    )
-                                    # Emit STEP_FINISHED only for completed items
-                                    if status == "completed":
-                                        yield _log_and_encode(
-                                            StepFinishedEvent(
-                                                type=EventType.STEP_FINISHED,
-                                                stepName=content,
-                                            )
-                                        )
+                                for step_event in step_tracker.process_todos(todos):
+                                    yield _log_and_encode(step_event)
                             else:
                                 # Emit backend tool call events (START, ARGS, END, RESULT)
                                 tool_call_id = chunk.data.get(
@@ -462,6 +768,22 @@ async def _stream_agui_text_message_event(message: str):
 
 def _is_tool_result_message(input_data: RunAgentInput) -> bool:
     return len(input_data.messages) > 0 and input_data.messages[-1].role == "tool"
+
+
+def _is_investigate_request(message: str) -> bool:
+    """Check if the message starts with 'investigate' (case insensitive)."""
+    return message.strip().lower().startswith("investigate")
+
+
+def _parse_investigate_message(message: str) -> str:
+    """Extract the alert filter from the investigate message."""
+    # Remove the "investigate" prefix (case insensitive)
+    stripped = message.strip()
+    if stripped.lower().startswith("investigate"):
+        # Remove "investigate" and any leading whitespace/punctuation
+        filter_text = stripped[len("investigate"):].lstrip(" :\t")
+        return filter_text if filter_text else ""
+    return message
 
 
 def _agui_input_to_holmes_chat_request(input_data: RunAgentInput) -> ChatRequest:

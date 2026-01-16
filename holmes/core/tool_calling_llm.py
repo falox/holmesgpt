@@ -1081,3 +1081,56 @@ class IssueInvestigator(ToolCallingLLM):
         )
         res.instructions = issue_runbooks
         return res
+
+    def investigate_stream(
+        self,
+        issue: Issue,
+        prompt: str,
+        global_instructions: Optional[Instructions] = None,
+        sections: Optional[InputSectionsDataType] = None,
+        runbooks: Optional[RunbookCatalog] = None,
+    ):
+        """
+        Streaming version of investigate. Yields stream events as the investigation progresses.
+        """
+        issue_runbooks = self.runbook_manager.get_instructions_for_issue(issue)
+
+        # Disable structured output for streaming
+        request_structured_output_from_llm = False
+        if not sections or len(sections) == 0:
+            sections = DEFAULT_SECTIONS
+
+        system_prompt = load_and_render_prompt(
+            prompt,
+            {
+                "issue": issue,
+                "sections": sections,
+                "structured_output": request_structured_output_from_llm,
+                "toolsets": self.tool_executor.toolsets,
+                "cluster_name": self.cluster_name,
+                "runbooks_enabled": True if runbooks else False,
+            },
+        )
+
+        base_user = f"\n #This is context from the issue:\n{issue.raw}"
+
+        runbooks_ctx = generate_runbooks_args(
+            runbook_catalog=runbooks,
+            global_instructions=global_instructions,
+            issue_instructions=issue_runbooks,
+        )
+        user_prompt = generate_user_prompt(
+            base_user,
+            runbooks_ctx,
+        )
+        logging.debug(
+            "Rendered system prompt:\n%s", textwrap.indent(system_prompt, "    ")
+        )
+        logging.debug("Rendered user prompt:\n%s", textwrap.indent(user_prompt, "    "))
+
+        # Use call_stream instead of prompt_call for streaming
+        yield from self.call_stream(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            sections=sections,
+        )
